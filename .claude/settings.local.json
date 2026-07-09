@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(New-Item -ItemType Directory -Force -Path \"models\", \"solvers\", \"builders\", \"exporters\", \"cli\", \"templates/desk\", \"library/profiles\", \"library/boards\", \"library/materials\", \"output\", \"tests\" | ForEach-Object { $_.FullName })",
+      "PowerShell(Get-Command pip -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-Command pip3 -ErrorAction SilentlyContinue)",
+      "PowerShell(py -0p 2>$null)",
+      "PowerShell(& \"C:\\\\Users\\\\mac\\\\.conda\\\\envs\\\\webrtc_env\\\\python.exe\" --version)",
+      "PowerShell($python = \"C:\\\\Users\\\\mac\\\\.conda\\\\envs\\\\webrtc_env\\\\python.exe\"; & $python -m pytest \"C:\\\\Users\\\\mac\\\\Desktop\\\\project\\\\Parametric Furniture Generator\\\\tests\\\\\" -v --tb=short 2>&1)",
+      "PowerShell($python = \"C:\\\\Users\\\\mac\\\\.conda\\\\envs\\\\webrtc_env\\\\python.exe\"; Set-Location \"C:\\\\Users\\\\mac\\\\Desktop\\\\project\\\\Parametric Furniture Generator\"; & $python -m pytest tests/ -v --tb=short 2>&1)",
+      "PowerShell($python = \"C:\\\\Users\\\\mac\\\\.conda\\\\envs\\\\webrtc_env\\\\python.exe\"; Set-Location \"C:\\\\Users\\\\mac\\\\Desktop\\\\project\\\\Parametric Furniture Generator\"; & $python -c \"import sys; sys.path.insert\\(0, r'C:\\\\Users\\\\mac\\\\Desktop\\\\project\\\\visualcad'\\); from visualcad import pipeline; print\\('VisualCAD available'\\)\" 2>&1)",
+      "PowerShell($python = \"C:\\\\Users\\\\mac\\\\.conda\\\\envs\\\\webrtc_env\\\\python.exe\"; Set-Location \"C:\\\\Users\\\\mac\\\\Desktop\\\\project\\\\Parametric Furniture Generator\"; & $python app.py build templates/desk/basic.yaml --width 1200 --depth 600 --height 750 --output output 2>&1)",
+      "PowerShell($python = \"C:\\\\Users\\\\mac\\\\.conda\\\\envs\\\\webrtc_env\\\\python.exe\"; Set-Location \"C:\\\\Users\\\\mac\\\\Desktop\\\\project\\\\Parametric Furniture Generator\"; & $python -m pytest tests/ -v --tb=line 2>&1)"
+    ]
+  }
+}

@@ -1,0 +1,8 @@
+# Library resources directory.
+
+# Profiles: DXF cross-section files for aluminum extrusion profiles (2020, 3030, 4040).
+# Generated automatically at build time if missing.
+
+# Boards: Board material reference data.
+
+# Materials: Density and property tables for furniture materials.

@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="basic_desk">
+  <link name="base_link"/>
+  <link name="tabletop">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/visual/tabletop.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/collision/tabletop.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="9.072"/>
+      <inertia ixx="0.272405" iyy="1.088885" izz="1.3608" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <link name="leg_front_left">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/visual/leg_front_left.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/collision/leg_front_left.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="2.464305"/>
+      <inertia ixx="0.110221" iyy="0.110221" izz="0.00037" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <link name="leg_front_right">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/visual/leg_front_right.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/collision/leg_front_right.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="2.464305"/>
+      <inertia ixx="0.110221" iyy="0.110221" izz="0.00037" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <link name="leg_back_left">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/visual/leg_back_left.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/collision/leg_back_left.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="2.464305"/>
+      <inertia ixx="0.110221" iyy="0.110221" izz="0.00037" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <link name="leg_back_right">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/visual/leg_back_right.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/collision/leg_back_right.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="2.464305"/>
+      <inertia ixx="0.110221" iyy="0.110221" izz="0.00037" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <link name="beam_front">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/visual/beam_front.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/collision/beam_front.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="3.63586"/>
+      <inertia ixx="0.353678" iyy="0.353678" izz="0.000545" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <link name="beam_back">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/visual/beam_back.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/collision/beam_back.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="3.63586"/>
+      <inertia ixx="0.353678" iyy="0.353678" izz="0.000545" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <link name="beam_left">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/visual/beam_left.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/collision/beam_left.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="1.615938"/>
+      <inertia ixx="0.031147" iyy="0.031147" izz="0.000242" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <link name="beam_right">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/visual/beam_right.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/collision/beam_right.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <mass value="1.615938"/>
+      <inertia ixx="0.031147" iyy="0.031147" izz="0.000242" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <joint name="base_to_tabletop" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 -0.009"/>
+    <parent link="base_link"/>
+    <child link="tabletop"/>
+  </joint>
+  <joint name="tabletop_to_leg_front_left" type="fixed">
+    <origin rpy="0 0 0" xyz="-0.57 0.27 -0.375"/>
+    <parent link="tabletop"/>
+    <child link="leg_front_left"/>
+  </joint>
+  <joint name="tabletop_to_leg_front_right" type="fixed">
+    <origin rpy="0 0 0" xyz="0.57 0.27 -0.375"/>
+    <parent link="tabletop"/>
+    <child link="leg_front_right"/>
+  </joint>
+  <joint name="tabletop_to_leg_back_left" type="fixed">
+    <origin rpy="0 0 0" xyz="-0.57 -0.27 -0.375"/>
+    <parent link="tabletop"/>
+    <child link="leg_back_left"/>
+  </joint>
+  <joint name="tabletop_to_leg_back_right" type="fixed">
+    <origin rpy="0 0 0" xyz="0.57 -0.27 -0.375"/>
+    <parent link="tabletop"/>
+    <child link="leg_back_right"/>
+  </joint>
+  <joint name="tabletop_to_beam_front" type="fixed">
+    <origin rpy="0 -1.570796 0" xyz="0 0.27 -0.039"/>
+    <parent link="tabletop"/>
+    <child link="beam_front"/>
+  </joint>
+  <joint name="tabletop_to_beam_back" type="fixed">
+    <origin rpy="0 -1.570796 0" xyz="0 -0.27 -0.039"/>
+    <parent link="tabletop"/>
+    <child link="beam_back"/>
+  </joint>
+  <joint name="tabletop_to_beam_left" type="fixed">
+    <origin rpy="-1.570796 0 0" xyz="-0.57 0 -0.039"/>
+    <parent link="tabletop"/>
+    <child link="beam_left"/>
+  </joint>
+  <joint name="tabletop_to_beam_right" type="fixed">
+    <origin rpy="-1.570796 0 0" xyz="0.57 0 -0.039"/>
+    <parent link="tabletop"/>
+    <child link="beam_right"/>
+  </joint>
+</robot>
