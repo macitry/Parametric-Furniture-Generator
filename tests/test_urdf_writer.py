@@ -8,15 +8,15 @@ from xml.etree.ElementTree import parse as parse_xml
 
 import pytest
 
-from exporters.urdf_writer import URDFWriter
-from models.furniture import (
+from parametric_furniture.exporters.urdf_writer import URDFWriter
+from parametric_furniture.models.furniture import (
     FurnitureAssembly,
     FurnitureJoint,
     FurnitureLink,
     FurniturePart,
     InertialData,
 )
-from models.pose import Pose
+from parametric_furniture.models.pose import Pose
 
 
 class TestURDFWriter:

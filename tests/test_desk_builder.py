@@ -8,12 +8,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from builders.furniture_builder import MaterialDensity
-from models.furniture import InertialData
-from models.parameter import DeskParameters
-from models.pose import Pose
-from models.template import FurnitureTemplate
-from solvers.furniture_solver import SolvedPart
+from parametric_furniture.builders.furniture_builder import MaterialDensity
+from parametric_furniture.models.furniture import InertialData
+from parametric_furniture.models.parameter import DeskParameters
+from parametric_furniture.models.pose import Pose
+from parametric_furniture.models.template import FurnitureTemplate
+from parametric_furniture.solvers.furniture_solver import SolvedPart
 
 
 class TestMaterialDensity:

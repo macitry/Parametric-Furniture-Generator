@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from models.template import (
+from parametric_furniture.models.template import (
     Connection,
     FurnitureTemplate,
     PartTemplate,

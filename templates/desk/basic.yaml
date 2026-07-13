@@ -16,43 +16,43 @@ parts:
   # ---- Legs ----
   - name: leg_front_left
     part_type: leg
-    profile: "2020"
+    profile: "3030"
     material: aluminum
 
   - name: leg_front_right
     part_type: leg
-    profile: "2020"
+    profile: "3030"
     material: aluminum
 
   - name: leg_back_left
     part_type: leg
-    profile: "2020"
+    profile: "3030"
     material: aluminum
 
   - name: leg_back_right
     part_type: leg
-    profile: "2020"
+    profile: "3030"
     material: aluminum
 
   # ---- Beams ----
   - name: beam_front
     part_type: beam
-    profile: "2020"
+    profile: "3030"
     material: aluminum
 
   - name: beam_back
     part_type: beam
-    profile: "2020"
+    profile: "3030"
     material: aluminum
 
   - name: beam_left
     part_type: beam
-    profile: "2020"
+    profile: "3030"
     material: aluminum
 
   - name: beam_right
     part_type: beam
-    profile: "2020"
+    profile: "3030"
     material: aluminum
 
   # ---- Tabletop ----

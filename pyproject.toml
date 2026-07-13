@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "parametric-furniture"
 version = "0.1.0"
 description = "Parametric Furniture Generator — declarative furniture templates to URDF."
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "Parametric Furniture Team"}
@@ -21,6 +21,9 @@ dependencies = [
     "lxml>=5.0.0",
 ]
 
+[project.scripts]
+furniture = "parametric_furniture.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
@@ -29,7 +32,10 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["models*", "solvers*", "builders*", "exporters*", "cli*"]
+include = ["parametric_furniture", "parametric_furniture.*"]
+
+[tool.setuptools.package-data]
+parametric_furniture = ["../templates/**/*.yaml", "../library/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

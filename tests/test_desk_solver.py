@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from models.parameter import DeskParameters
-from models.template import FurnitureTemplate, PartTemplate
-from solvers.desk_solver import DeskSolver
-from solvers.furniture_solver import SolvedPart, SolverOutput
+from parametric_furniture.models.parameter import DeskParameters
+from parametric_furniture.models.template import FurnitureTemplate, PartTemplate
+from parametric_furniture.solvers.desk_solver import DeskSolver
+from parametric_furniture.solvers.furniture_solver import SolvedPart, SolverOutput
 
 
 class TestDeskSolver:
@@ -211,7 +211,7 @@ class TestDeskSolver:
 
     def test_rejects_wrong_template_type(self, solver: DeskSolver) -> None:
         """Should raise ValueError if template type is not 'desk'."""
-        from models.template import FurnitureTemplate
+        from parametric_furniture.models.template import FurnitureTemplate
 
         template = FurnitureTemplate(
             name="Test",
