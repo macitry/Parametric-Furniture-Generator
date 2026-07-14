@@ -6,3 +6,9 @@ venv/
 .env
 *.egg-info/
 dist/
+
+# Generated output — keep directory structure only
+output/*
+!output/pregen/
+output/pregen/*
+!output/pregen/.gitkeep
