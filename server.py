@@ -19,6 +19,8 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
+from contextlib import asynccontextmanager
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -43,7 +45,16 @@ from parametric_furniture import (
 # App setup
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="WoodCraft Backend v2", version="0.2.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup: launch cache warmup in background. Shutdown: no-op."""
+    logger.info("Cache warmup starts in background...")
+    threading.Thread(target=_warmup, daemon=True).start()
+    yield
+    logger.info("Server shutting down.")
+
+
+app = FastAPI(title="WoodCraft Backend v2", version="0.2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -189,6 +200,25 @@ def _cache_key(req: GenerateRequest) -> str:
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
+
+def _cleanup_old_models(keep: int = 5):
+    """Delete old model dirs, but never delete ones still referenced by cache."""
+    cached_ids = {e["model_id"] for e in model_cache.values()}
+    dirs = sorted(
+        [d for d in OUTPUT_DIR.iterdir() if d.is_dir() and d.name != "pregen"],
+        key=lambda p: p.stat().st_mtime, reverse=True,
+    )
+    # Delete dirs beyond `keep`, skipping cached ones
+    deleted = 0
+    for d in dirs:
+        if deleted >= max(len(dirs) - keep, 0):
+            break
+        if d.name not in cached_ids:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+            deleted += 1
+
+
 def _normalize_dims(dims: dict | None) -> dict | None:
     """Normalize builder dimension keys to consistent names."""
     if not dims:
@@ -212,11 +242,14 @@ def _find_solved(solved, name: str):
     return None
 
 
-def _do_generate_with_progress(req: GenerateRequest) -> dict:
+def _do_generate_with_progress(req: GenerateRequest, model_id: str | None = None) -> dict:
     """Wrapper that updates progress_state during generation.
 
     Monitors the output directory for new STL files to track per-part progress.
     """
+    if model_id is None:
+        model_id = str(uuid.uuid4())[:8]
+
     global progress_state
     progress_state["phase"] = "generating"
     progress_state["current"] = 0
@@ -224,8 +257,6 @@ def _do_generate_with_progress(req: GenerateRequest) -> dict:
     progress_state["part"] = "solving..."
 
     # ---- Background thread: watch output dir for new STL files ----
-    # We need to create a temp output dir first so we know where to watch.
-    model_id = str(uuid.uuid4())[:8]
     watch_dir = OUTPUT_DIR / model_id
     watch_dir.mkdir(parents=True, exist_ok=True)
 
@@ -469,6 +500,13 @@ def _get_or_generate(req: GenerateRequest) -> dict:
         "current": 0, "total": 0, "config": 0, "config_total": 0, "part": "",
     }
 
+    _cleanup_old_models()
+    # Limit cache to 20 entries (evict oldest)
+    while len(model_cache) > 20:
+        oldest_key = min(model_cache.keys(), key=lambda k: model_cache[k].get("_cached_at", 0))
+        del model_cache[oldest_key]
+        logger.debug(f"Cache evicted: {oldest_key}")
+    entry["_cached_at"] = time.time()
     logger.info(f"Cached: {key} ({entry['status']}, {len(entry['parts'])} parts)")
     return entry
 
@@ -483,38 +521,35 @@ WARMUP_CONFIGS = [
 ]
 
 
-@app.on_event("startup")
-def warmup_cache():
-    """Pre-generate common configurations on startup (non-blocking)."""
-    def _warmup():
-        global progress_state
-        progress_state = {
-            "phase": "warming", "message": "预热默认配置...",
-            "current": 0, "total": len(WARMUP_CONFIGS) * 9,  # 9 parts per config
-            "config": 0, "config_total": len(WARMUP_CONFIGS), "part": "",
-        }
-        logger.info(f"Cache warmup: generating {len(WARMUP_CONFIGS)} config(s)...")
-        for i, cfg in enumerate(WARMUP_CONFIGS):
-            key = _cache_key(cfg)
-            with _cache_lock:
-                if key in model_cache:
-                    progress_state["current"] = (i + 1) * 9
-                    continue
-            progress_state["config"] = i + 1
-            progress_state["part"] = "solving..."
-            logger.info(f"Warmup [{i+1}/{len(WARMUP_CONFIGS)}]: {cfg.width}x{cfg.depth}x{cfg.height}")
-            entry = _do_generate_with_progress(cfg)
-            with _cache_lock:
-                model_cache[key] = entry
-            progress_state["current"] = (i + 1) * 9
-            logger.info(f"Warmup [{i+1}/{len(WARMUP_CONFIGS)}] done: {entry['status']}")
-        progress_state = {
-            "phase": "idle", "message": "就绪",
-            "current": 0, "total": 0, "config": 0, "config_total": 0, "part": "",
-        }
-        logger.info(f"Cache warmup complete. {len(model_cache)} entries cached.")
-
-    threading.Thread(target=_warmup, daemon=True).start()
+def _warmup() -> None:
+    """Pre-generate common configurations in background."""
+    global progress_state
+    progress_state = {
+        "phase": "warming", "message": "预热默认配置...",
+        "current": 0, "total": len(WARMUP_CONFIGS) * 9,
+        "config": 0, "config_total": len(WARMUP_CONFIGS), "part": "",
+    }
+    logger.info(f"Cache warmup: generating {len(WARMUP_CONFIGS)} config(s)...")
+    for i, cfg in enumerate(WARMUP_CONFIGS):
+        key = _cache_key(cfg)
+        with _cache_lock:
+            if key in model_cache:
+                progress_state["current"] = (i + 1) * 9
+                continue
+        progress_state["config"] = i + 1
+        progress_state["part"] = "solving..."
+        logger.info(f"Warmup [{i+1}/{len(WARMUP_CONFIGS)}]: {cfg.width}x{cfg.depth}x{cfg.height}")
+        entry = _do_generate_with_progress(cfg)
+        with _cache_lock:
+            model_cache[key] = entry
+        progress_state["current"] = (i + 1) * 9
+        logger.info(f"Warmup [{i+1}/{len(WARMUP_CONFIGS)}] done: {entry['status']}")
+    progress_state = {
+        "phase": "idle", "message": "就绪",
+        "current": 0, "total": 0, "config": 0, "config_total": 0, "part": "",
+    }
+    logger.info(f"Cache warmup complete. {len(model_cache)} entries cached.")
+    _cleanup_old_models()
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +609,7 @@ def get_default_model() -> GenerateResponse:
 
     if cached:
         logger.info("Default model: cache HIT")
+        _cleanup_old_models()
         return GenerateResponse(
             model_id=cached["model_id"], name=cached["name"],
             status=cached["status"],
@@ -598,24 +634,63 @@ def get_default_model() -> GenerateResponse:
 
 @app.post("/api/models/generate")
 def generate_model(req: GenerateRequest) -> GenerateResponse:
-    """Generate model (from cache if available, otherwise generate + cache)."""
+    """Generate model (from cache if available, otherwise solve → return immediately, build in background).
+
+    Pattern:
+      - Cache hit → instant full response
+      - Cache miss → solver data immediately (<100ms), background CAD generation
+      - Frontend polls until stl_url is populated
+    """
     meta = TEMPLATE_META.get(req.template_id)
     if not meta:
         raise HTTPException(404, f"Template not found: {req.template_id}")
 
-    entry = _get_or_generate(req)
-    message = None
-    if entry["status"] == "solver_only":
-        message = "CAD build failed. Using solver data."
+    key = _cache_key(req)
+
+    with _cache_lock:
+        cached = model_cache.get(key)
+
+    if cached:
+        logger.info(f"Generate: cache HIT {key}")
+        return GenerateResponse(
+            model_id=cached["model_id"], name=cached["name"], status=cached["status"],
+            parts=[PartInfo(**p) for p in cached["parts"]],
+            dimensions=cached["dimensions"],
+            stl_url=cached.get("stl_url"),
+            urdf_url=cached.get("urdf_url"),
+            joints=cached.get("joints", []),
+        )
+
+    # Cache miss — solver data immediately, then background generation
+    logger.info(f"Generate: cache MISS {key} — returning solver data, backgrounding CAD")
+
+    # 1. Solver-only for immediate response
+    solver_entry = _solver_only_generate(req)
+    model_id = solver_entry["model_id"]
+
+    # 2. Register a placeholder in cache so subsequent polls get solver data
+    with _cache_lock:
+        model_cache[key] = solver_entry
+
+    # 3. Background thread: generate CAD + STL, then update cache
+    def _background_build():
+        try:
+            full_entry = _do_generate_with_progress(req, model_id=model_id)
+            with _cache_lock:
+                model_cache[key] = full_entry
+            logger.info(f"Background generation complete: {model_id} ({full_entry['status']})")
+        except Exception as exc:
+            logger.error(f"Background generation failed: {exc}")
+            solver_entry["message"] = f"Cad build failed: {exc}"
+
+    threading.Thread(target=_background_build, daemon=True).start()
 
     return GenerateResponse(
-        model_id=entry["model_id"], name=entry["name"], status=entry["status"],
-        parts=[PartInfo(**p) for p in entry["parts"]],
-        dimensions=entry["dimensions"],
-        stl_url=entry.get("stl_url"),
-        urdf_url=entry.get("urdf_url"),
-        joints=entry.get("joints", []),
-        message=message,
+        model_id=model_id, name=meta["name"],
+        status="warming",
+        parts=[PartInfo(**p) for p in solver_entry["parts"]],
+        dimensions=solver_entry["dimensions"],
+        message="CAD generation started in background. Poll /api/models/default or retry this endpoint.",
     )
 
 
@@ -1462,5 +1537,4 @@ app.mount("/static/models", StaticFiles(directory=str(OUTPUT_DIR)), name="static
 if __name__ == "__main__":
     import uvicorn
     logger.info("WoodCraft Backend v2 → http://0.0.0.0:8000")
-    logger.info("Cache warmup starts in background...")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
