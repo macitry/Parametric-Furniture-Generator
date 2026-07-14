@@ -126,12 +126,20 @@ class DeskBuilder(AbstractFurnitureBuilder):
                     height=extrude_height,
                     direction="symmetric",
                 )
-                # Some profile DXFs have geometry offset from origin;
-                # translate so the profile centre lands at (0, 0).
-                cx, cy = self._PROFILE_OFFSETS.get(solved.profile, (0, 0))
-                if cx or cy:
-                    from build123d import Vector
+                # Profile DXFs may have geometry offset from origin
+                # (e.g. engineering drawings).  Centre the extruded
+                # solid using its actual bounding box so the mesh
+                # origin lands at the geometric centre.
+                from build123d import Vector
+                bbox = solid.bounding_box()
+                cx = (bbox.max.X + bbox.min.X) / 2.0
+                cy = (bbox.max.Y + bbox.min.Y) / 2.0
+                if abs(cx) > 0.001 or abs(cy) > 0.001:
                     solid = solid.translate(Vector(-cx, -cy, 0))
+                    logger.debug(
+                        f"Centred solid {solved.name}: "
+                        f"offset=({cx:.2f}, {cy:.2f})"
+                    )
             except Exception as exc:
                 logger.error(f"VisualCAD pipeline failed for {solved.name}: {exc}")
                 raise
@@ -303,25 +311,16 @@ class DeskBuilder(AbstractFurnitureBuilder):
                       neck_d=1.5, total_d=8.0, hole_r=4.2),
     }
 
-    # DXF files whose geometry is not centred at (0, 0).  After the
-    # VisualCAD pipeline produces the solid we translate it so the
-    # profile lands at the origin.  Values are the (cx, cy) centre
-    # of the extruded solid as reported by ``solid.center()``.
-    _PROFILE_OFFSETS: dict[str, tuple[float, float]] = {
-        # Measured from MJ-8-3030.dxf STL output (60×60 mm bounding box)
-        "3030": (378.06, 170.27),
-    }
-
     def _ensure_profiles_exist(self, profile_dir: Path) -> None:
         """Generate aluminium extrusion profile DXF files.
 
         Creates proper T-slot profiles with centre holes for common
-        aluminium extrusion sizes (2020, 3030, 4040).  Previously
-        generated files are left untouched.
+        aluminium extrusion sizes (2020, 4040).  For 3030, copies the
+        user-provided MJ-8-3030.dxf engineering drawing as-is.
+        Previously generated files are left untouched.
 
-        For 3030 the original MJ-8-3030.dxf engineering drawing is
-        copied as-is (never modified).  The resulting solid is centred
-        in XY using a post-extrusion translation.
+        Post-extrusion centring is handled dynamically via bounding box
+        in ``build()`` — no hardcoded offsets needed.
 
         Args:
             profile_dir: Directory to store profile DXF files.

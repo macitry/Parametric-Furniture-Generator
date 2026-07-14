@@ -58,9 +58,19 @@ OUTPUT_DIR = BASE_DIR / "output"
 CACHE_DIR = OUTPUT_DIR / "pregen"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Thread-safe cache
+# Thread-safe cache and progress
 _cache_lock = threading.Lock()
 model_cache: dict[str, dict] = {}
+
+progress_state: dict = {
+    "phase": "idle",        # "idle" | "warming" | "generating"
+    "message": "",
+    "current": 0,
+    "total": 0,
+    "config": 0,            # which warmup config
+    "config_total": 0,
+    "part": "",             # current part name
+}
 
 # ---------------------------------------------------------------------------
 # Schemas
@@ -179,6 +189,17 @@ def _cache_key(req: GenerateRequest) -> str:
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
+def _normalize_dims(dims: dict | None) -> dict | None:
+    """Normalize builder dimension keys to consistent names."""
+    if not dims:
+        return None
+    d = dict(dims)
+    # Builder uses "length" for extrusion length; unify to "extrusion_length"
+    if "length" in d and "extrusion_length" not in d:
+        d["extrusion_length"] = d.pop("length")
+    return d
+
+
 def _load_template(template_id: str) -> FurnitureTemplate:
     path = TEMPLATES_DIR / "desk" / "basic.yaml"
     return FurnitureTemplate.from_yaml(str(path))
@@ -191,8 +212,65 @@ def _find_solved(solved, name: str):
     return None
 
 
-def _do_generate(req: GenerateRequest) -> dict:
+def _do_generate_with_progress(req: GenerateRequest) -> dict:
+    """Wrapper that updates progress_state during generation.
+
+    Monitors the output directory for new STL files to track per-part progress.
+    """
+    global progress_state
+    progress_state["phase"] = "generating"
+    progress_state["current"] = 0
+    progress_state["total"] = 9
+    progress_state["part"] = "solving..."
+
+    # ---- Background thread: watch output dir for new STL files ----
+    # We need to create a temp output dir first so we know where to watch.
+    model_id = str(uuid.uuid4())[:8]
+    watch_dir = OUTPUT_DIR / model_id
+    watch_dir.mkdir(parents=True, exist_ok=True)
+
+    stop_watch = threading.Event()
+    seen_files: set[str] = set()
+
+    def watch_stl_files():
+        while not stop_watch.is_set():
+            try:
+                stls = list(watch_dir.rglob("visual/*.stl"))
+                for stl in stls:
+                    name = stl.stem
+                    if name not in seen_files:
+                        seen_files.add(name)
+                        progress_state["current"] = len(seen_files)
+                        progress_state["part"] = f"{name} ({len(seen_files)}/9)"
+            except Exception:
+                pass
+            stop_watch.wait(0.5)  # poll every 500ms
+
+    watcher = threading.Thread(target=watch_stl_files, daemon=True)
+    watcher.start()
+    # ----------------------------------------------------------------
+
+    try:
+        # Override the output dir so files land in our watched directory
+        result = _do_generate(req, model_id=model_id)
+        # Final sweep
+        stls = list(watch_dir.rglob("visual/*.stl"))
+        progress_state["current"] = min(len(stls), 9)
+        progress_state["part"] = "done"
+        return result
+    except Exception:
+        progress_state["phase"] = "idle"
+        raise
+    finally:
+        stop_watch.set()
+        watcher.join(timeout=2)
+
+
+def _do_generate(req: GenerateRequest, model_id: str | None = None) -> dict:
     """Run the full pipeline: template → solve → build. Returns cache entry dict."""
+    if model_id is None:
+        model_id = str(uuid.uuid4())[:8]
+
     template = _load_template(req.template_id)
     params = DeskParameters(
         width=req.width, depth=req.depth, height=req.height,
@@ -201,8 +279,6 @@ def _do_generate(req: GenerateRequest) -> dict:
     )
     solved = DeskSolver().solve(template, params)
     meta = TEMPLATE_META[req.template_id]
-
-    model_id = str(uuid.uuid4())[:8]
 
     # Fast mode: skip CAD, generate simple box STLs directly
     if req.stl_quality == "fast":
@@ -322,7 +398,7 @@ def _do_generate(req: GenerateRequest) -> dict:
             parts.append({
                 "name": part.name, "part_type": part.part_type,
                 "material": sp.material if sp else "",
-                "dimensions": {k: v for k, v in part.dimensions.items()} if part.dimensions else None,
+                "dimensions": _normalize_dims(part.dimensions),
                 "mass_kg": part.mass_kg, "stl_url": stl_path,
                 "pose": urdf_pose,
                 "joint_parent": next((j["parent"] for j in joints if j["child"] == part.name), None),
@@ -381,10 +457,17 @@ def _get_or_generate(req: GenerateRequest) -> dict:
             return model_cache[key]
 
     logger.info(f"Cache MISS: {key} — generating...")
-    entry = _do_generate(req)
+    entry = _do_generate_with_progress(req)
 
     with _cache_lock:
         model_cache[key] = entry
+
+    # Reset progress to idle
+    global progress_state
+    progress_state = {
+        "phase": "idle", "message": "就绪",
+        "current": 0, "total": 0, "config": 0, "config_total": 0, "part": "",
+    }
 
     logger.info(f"Cached: {key} ({entry['status']}, {len(entry['parts'])} parts)")
     return entry
@@ -404,17 +487,31 @@ WARMUP_CONFIGS = [
 def warmup_cache():
     """Pre-generate common configurations on startup (non-blocking)."""
     def _warmup():
+        global progress_state
+        progress_state = {
+            "phase": "warming", "message": "预热默认配置...",
+            "current": 0, "total": len(WARMUP_CONFIGS) * 9,  # 9 parts per config
+            "config": 0, "config_total": len(WARMUP_CONFIGS), "part": "",
+        }
         logger.info(f"Cache warmup: generating {len(WARMUP_CONFIGS)} config(s)...")
         for i, cfg in enumerate(WARMUP_CONFIGS):
             key = _cache_key(cfg)
             with _cache_lock:
                 if key in model_cache:
+                    progress_state["current"] = (i + 1) * 9
                     continue
+            progress_state["config"] = i + 1
+            progress_state["part"] = "solving..."
             logger.info(f"Warmup [{i+1}/{len(WARMUP_CONFIGS)}]: {cfg.width}x{cfg.depth}x{cfg.height}")
-            entry = _do_generate(cfg)
+            entry = _do_generate_with_progress(cfg)
             with _cache_lock:
                 model_cache[key] = entry
+            progress_state["current"] = (i + 1) * 9
             logger.info(f"Warmup [{i+1}/{len(WARMUP_CONFIGS)}] done: {entry['status']}")
+        progress_state = {
+            "phase": "idle", "message": "就绪",
+            "current": 0, "total": 0, "config": 0, "config_total": 0, "part": "",
+        }
         logger.info(f"Cache warmup complete. {len(model_cache)} entries cached.")
 
     threading.Thread(target=_warmup, daemon=True).start()
@@ -427,6 +524,12 @@ def warmup_cache():
 @app.get("/api/health")
 def health():
     return {"status": "ok", "cache_size": len(model_cache)}
+
+
+@app.get("/api/progress")
+def get_progress():
+    """Current warmup/generation progress for the frontend progress bar."""
+    return progress_state
 
 
 @app.get("/api/templates")
