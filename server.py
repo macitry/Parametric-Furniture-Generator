@@ -1528,6 +1528,7 @@ def _solver_only_generate(req: GenerateRequest) -> dict:
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static/models", StaticFiles(directory=str(OUTPUT_DIR)), name="static_models")
+app.mount("/static/library", StaticFiles(directory=str(BASE_DIR / "library")), name="static_library")
 
 
 # ---------------------------------------------------------------------------
