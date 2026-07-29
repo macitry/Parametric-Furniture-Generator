@@ -1526,6 +1526,121 @@ def _solver_only_generate(req: GenerateRequest) -> dict:
 # Static files
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Bracket Rotation Solver
+# ---------------------------------------------------------------------------
+
+class BracketRotationRequest(BaseModel):
+    """Two face normals (unit vectors in assembly frame)."""
+    face1: list[float]  # [x, y, z] normal of first selected face
+    face2: list[float]  # [x, y, z] normal of second selected face
+
+
+class BracketRotationResponse(BaseModel):
+    roll: float   # degrees, ZYX intrinsic Euler
+    pitch: float
+    yaw: float
+    rotation_matrix: list[list[float]]  # 3×3, for debugging
+
+
+@app.post("/api/bracket/rotation")
+def compute_bracket_rotation(req: BracketRotationRequest) -> BracketRotationResponse:
+    try:
+        return _compute(req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Bracket rotation failed: {e}", exc_info=True)
+        raise HTTPException(500, str(e))
+
+def _compute(req: BracketRotationRequest) -> BracketRotationResponse:
+    logger.info(f"Bracket rotation: face1={req.face1}, face2={req.face2}")
+    import sys
+    try:
+        f1 = np.array(req.face1, dtype=float)
+        f2 = np.array(req.face2, dtype=float)
+        f1 /= np.linalg.norm(f1)
+        f2 /= np.linalg.norm(f2)
+        # Sort by axis index so click order doesn't affect rotation
+        def _axis_idx(v): return int(np.argmax(np.abs(v)))
+        if _axis_idx(f1) > _axis_idx(f2):
+            f1, f2 = f2, f1
+        print(f"  step1: f1={f1}, f2={f2} (sorted)", flush=True)
+
+        # Bracket default flat faces (from STL analysis): choose per axis
+        BRACKET_FACE = {0: np.array([-1.0, 0.0, 0.0]),  # X axis
+                        1: np.array([0.0, -1.0, 0.0]),  # Y axis
+                        2: np.array([0.0, 0.0, 1.0])}   # Z axis
+        a1 = int(np.argmax(np.abs(f1)))
+        a2 = int(np.argmax(np.abs(f2)))
+        d1 = BRACKET_FACE[a1]
+        d2 = BRACKET_FACE[a2]
+        d3 = np.cross(d1, d2)
+        d3 /= np.linalg.norm(d3)
+        print(f"  step2: d1={d1}, d2={d2}, axes={a1},{a2}", flush=True)
+
+        t1 = -f1; t2 = -f2
+        t3 = np.cross(t1, t2)
+        n3 = np.linalg.norm(t3)
+        if n3 < 1e-10:
+            raise HTTPException(400, "Face normals are parallel")
+        t3 /= n3
+        print(f"  step3: t1={t1}, t2={t2}, t3={t3}", flush=True)
+
+        # Manual 3x3 matrix multiply to avoid numpy threading issues
+        def mat_mul(A, B):
+            return [[sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+        def transpose(M):
+            return [[M[j][i] for j in range(3)] for i in range(3)]
+
+        S_mat = [[float(d1[i]), float(d2[i]), float(d3[i])] for i in range(3)]
+        T_mat = [[float(t1[i]), float(t2[i]), float(t3[i])] for i in range(3)]
+        R_mat = mat_mul(T_mat, transpose(S_mat))
+        print(f"  step4: R={R_mat}", flush=True)
+
+        R = np.array(R_mat)
+
+        r20 = R_mat[2][0]; r21 = R_mat[2][1]; r22 = R_mat[2][2]
+        r10 = R_mat[1][0]; r00 = R_mat[0][0]; r01 = R_mat[0][1]; r02 = R_mat[0][2]
+        import math
+        if abs(r20) < 0.99999:
+            pitch = -math.asin(r20)
+            roll = math.atan2(r21, r22)
+            yaw = math.atan2(r10, r00)
+        else:
+            yaw = 0.0
+            pitch = math.pi / 2 if r20 < -0.99999 else -math.pi / 2
+            roll = math.atan2(-r01, r02)
+        print(f"  step5: roll={roll}, pitch={pitch}, yaw={yaw}", flush=True)
+
+        # Z+face pairs: same sign → 270deg, opposite → 90deg
+        if 2 in (a1, a2):
+            z_face = f1 if a1 == 2 else f2
+            z_sign = 1 if z_face[2] > 0 else -1
+            other = f2 if a1 == 2 else f1
+            other_ax = a2 if a1 == 2 else a1
+            other_sign = 1 if other[other_ax] > 0 else -1
+            same_sign = (other_sign == z_sign)
+            pitch += 3 * math.pi / 2 if same_sign else math.pi / 2
+
+        r = BracketRotationResponse(
+            roll=round(float(math.degrees(roll)), 1),
+            pitch=round(float(math.degrees(pitch)), 1),
+            yaw=round(float(math.degrees(yaw)), 1),
+            rotation_matrix=R_mat,
+        )
+        logger.info(f"  step6: response ready")
+        return r
+    except Exception:
+        logger.exception("Bracket rotation crashed")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Static files
+# ---------------------------------------------------------------------------
+
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static/models", StaticFiles(directory=str(OUTPUT_DIR)), name="static_models")
 app.mount("/static/library", StaticFiles(directory=str(BASE_DIR / "library")), name="static_library")

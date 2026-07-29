@@ -117,8 +117,9 @@ pip install -e ".[server]"
 
 ```bash
 # 方式一：激活 conda 环境后启动
+
 conda activate webrtc_env
-python server.py
+python server.py 
 
 # 方式二：直接指定 conda 环境的 Python
 C:/Users/mac/.conda/envs/webrtc_env/python.exe server.py
