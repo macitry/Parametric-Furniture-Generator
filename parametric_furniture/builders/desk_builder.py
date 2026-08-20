@@ -46,8 +46,17 @@ from .furniture_builder import (
     register_builder,
 )
 
-# VisualCAD is an external dependency at a known path.
-_VISUALCAD_ROOT = Path(__file__).resolve().parent.parent.parent / "visualcad"
+# VisualCAD is an external dependency. It may live either as a sibling of
+# the project root (../visualcad, the cad_ws workspace layout) or inside it.
+_proj_root = Path(__file__).resolve().parent.parent.parent
+_VISUALCAD_CANDIDATES = [
+    _proj_root.parent / "visualcad",   # sibling:  <ws>/visualcad
+    _proj_root / "visualcad",          # inside:   <proj>/visualcad
+]
+_VISUALCAD_ROOT = next(
+    (p for p in _VISUALCAD_CANDIDATES if p.exists()),
+    _VISUALCAD_CANDIDATES[0],
+)
 if str(_VISUALCAD_ROOT) not in sys.path:
     sys.path.insert(0, str(_VISUALCAD_ROOT))
 

@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -47,11 +50,16 @@ from parametric_furniture import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: launch cache warmup in background. Shutdown: no-op."""
-    logger.info("Cache warmup starts in background...")
+    """Startup: write our pid (single-instance guard), launch warmup. Shutdown: clean up pid."""
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    SERVER_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    logger.info(f"Cache warmup starts in background... (pid={os.getpid()})")
     threading.Thread(target=_warmup, daemon=True).start()
-    yield
-    logger.info("Server shutting down.")
+    try:
+        yield
+    finally:
+        SERVER_PID_FILE.unlink(missing_ok=True)
+        logger.info("Server shutting down.")
 
 
 app = FastAPI(title="WoodCraft Backend v2", version="0.2.0", lifespan=lifespan)
@@ -68,10 +76,85 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 OUTPUT_DIR = BASE_DIR / "output"
 CACHE_DIR = OUTPUT_DIR / "pregen"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR = BASE_DIR / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+DIY_BRACKET_LOG = LOGS_DIR / "diy_brackets.jsonl"
+SERVER_PID_FILE = LOGS_DIR / "server.pid"
 
 # Thread-safe cache and progress
 _cache_lock = threading.Lock()
+_log_lock = threading.Lock()
 model_cache: dict[str, dict] = {}
+
+
+# ---------------------------------------------------------------------------
+# Single-instance guard: detect an already-running backend on second launch
+# ---------------------------------------------------------------------------
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this pid is running (probe only, no kill)."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _find_port_pid(port: int) -> Optional[int]:
+    """Best-effort PID of the process LISTENING on `port`."""
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(
+                ["netstat", "-ano"], capture_output=True, text=True, timeout=10
+            ).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                if (
+                    len(parts) >= 5
+                    and parts[0] == "TCP"
+                    and parts[1].endswith(f":{port}")
+                    and parts[3] == "LISTENING"
+                ):
+                    try:
+                        return int(parts[4])
+                    except ValueError:
+                        continue
+        else:
+            out = subprocess.run(
+                ["lsof", "-nP", "-iTCP:%d" % port, "-sTCP:LISTEN"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+            for line in out.splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        return int(parts[1])
+                    except ValueError:
+                        continue
+    except Exception:
+        pass
+    return None
+
+
+def _kill_command(pid: int) -> str:
+    """Shell command that kills the given pid (copy-paste ready)."""
+    return f"taskkill /PID {pid} /F" if sys.platform == "win32" else f"kill -9 {pid}"
+
+
+def running_server_pid() -> Optional[int]:
+    """PID of an already-running backend instance, or None.
+
+    Checks the pid file first (fast, reliable), then falls back to the port —
+    this also catches instances started before the pid file mechanism existed.
+    """
+    if SERVER_PID_FILE.exists():
+        try:
+            pid = int(SERVER_PID_FILE.read_text(encoding="utf-8").strip())
+            if _pid_alive(pid):
+                return pid
+        except (ValueError, OSError):
+            pass
+    return _find_port_pid(8000)
 
 progress_state: dict = {
     "phase": "idle",        # "idle" | "warming" | "generating"
@@ -311,14 +394,8 @@ def _do_generate(req: GenerateRequest, model_id: str | None = None) -> dict:
     solved = DeskSolver().solve(template, params)
     meta = TEMPLATE_META[req.template_id]
 
-    # Fast mode: skip CAD, generate simple box STLs directly
-    if req.stl_quality == "fast":
-        return _generate_fast(meta, req, solved, model_id)
-
-    # Trimesh mode: use ezdxf + trimesh extrusion (fast, DXF profile detail)
-    if req.stl_quality == "trimesh":
-        return _generate_trimesh(meta, req, solved, model_id)
-
+    # All requests go through the full DeskBuilder (VisualCAD) pipeline;
+    # the legacy "fast"/"trimesh" quality tiers were removed.
     parts: list[dict] = []
     status = "solver_only"
     stl_url = None
@@ -516,8 +593,8 @@ def _get_or_generate(req: GenerateRequest) -> dict:
 # ---------------------------------------------------------------------------
 
 WARMUP_CONFIGS = [
-    GenerateRequest(template_id="basic-desk", width=1200, depth=600, height=750, profile="3030", stl_quality="trimesh"),
-    GenerateRequest(template_id="basic-desk", width=1500, depth=700, height=750, profile="3030", stl_quality="trimesh"),
+    GenerateRequest(template_id="basic-desk", width=1200, depth=600, height=750, profile="3030", stl_quality="web"),
+    GenerateRequest(template_id="basic-desk", width=1500, depth=700, height=750, profile="3030", stl_quality="web"),
 ]
 
 
@@ -719,771 +796,6 @@ def get_drawings(model_id: str) -> DrawingListResponse:
     raise HTTPException(404, f"Model not found: {model_id}")
 
 
-def _build123d_extrude(
-    profile: str, length_mm: float, filepath_stl: Path, filepath_step: Path | None = None,
-    tabletop_w: float = 0, tabletop_d: float = 0,
-) -> bool:
-    """Create an extruded solid via build123d, export STEP + STL.
-
-    - Reads DXF profile via ezdxf
-    - Creates a Face from the outer wire
-    - Extrudes to a Solid
-    - Exports STEP (B-Rep) and STL (tessellated)
-    - Returns True on success
-    """
-    from build123d import (
-        Face, Wire, Solid, Vector,
-        export_step, Mesher,
-    )
-
-    if tabletop_w > 0:
-        # Rectangular tabletop outline
-        hw, hd = tabletop_w / 2.0, tabletop_d / 2.0
-        profile_verts = [
-            Vector(-hw, -hd, 0), Vector(hw, -hd, 0),
-            Vector(hw, hd, 0), Vector(-hw, hd, 0),
-        ]
-        hole_wires = []
-    else:
-        # Read DXF via OCP's native DXF reader (via VisualCAD importer).
-        # This correctly handles POLYLINE, ARC, and connected entities,
-        # producing proper contours with holes (T-slots preserved).
-        import sys
-        _visualcad_root = Path(__file__).resolve().parent.parent / "visualcad"
-        if str(_visualcad_root) not in sys.path:
-            sys.path.insert(0, str(_visualcad_root))
-        from visualcad.cad.importer import DXFImporter, DXFImportParameters, ContourType
-
-        profile_dir = BASE_DIR / "library" / "profiles"
-        dxf_path = profile_dir / f"{profile}.dxf"
-        if not dxf_path.exists():
-            return False
-
-        try:
-            params = DXFImportParameters(file_path=dxf_path)
-            importer = DXFImporter(params)
-            all_contours = importer.import_contours()
-        except Exception as e:
-            logger.warning(f"OCP DXF import error: {e}")
-            return False
-
-        if not all_contours:
-            return False
-
-        # Extract outer contour vertices
-        outer_contour = next((c for c in all_contours if c.contour_type == ContourType.OUTER), None)
-        if not outer_contour or len(outer_contour.edges) < 3:
-            return False
-
-        outer_verts = [e.start for e in outer_contour.edges]
-        outer_verts.append(outer_contour.edges[-1].end)
-        profile_verts = [Vector(float(v[0]), float(v[1]), 0.0) for v in outer_verts]
-
-        # Extract hole contours (including CIRCLE holes which have only 1 edge)
-        hole_wires = []
-        for c in all_contours:
-            if c.contour_type == ContourType.OUTER:
-                continue
-            # Handle both multi-edge contours and single-edge circles
-            if len(c.edges) >= 3:
-                hole_verts = [e.start for e in c.edges]
-                hole_verts.append(c.edges[-1].end)
-            elif len(c.edges) == 1:
-                # Circle: use edge.center and edge.radius directly
-                edge = c.edges[0]
-                cx = float(edge.center[0]) if hasattr(edge, 'center') else float(edge.start[0])
-                cy = float(edge.center[1]) if hasattr(edge, 'center') else float(edge.start[1])
-                r = float(edge.radius) if hasattr(edge, 'radius') else 0.0
-                if r < 0.01:
-                    continue
-                hole_verts = []
-                import math
-                for k in range(32):
-                    angle = 2.0 * math.pi * k / 32.0
-                    hole_verts.append((
-                        cx + r * math.cos(angle),
-                        cy + r * math.sin(angle),
-                    ))
-            else:
-                continue  # too few edges, skip
-
-            try:
-                hw = Wire.make_polygon(
-                    [Vector(float(v[0]), float(v[1]), 0.0) for v in hole_verts],
-                    close=True,
-                )
-                hole_wires.append(hw)
-            except Exception:
-                pass
-
-        logger.info(f"OCP DXF: {len(profile_verts)} outer verts, {len(hole_wires)} holes")
-
-    try:
-        wire = Wire.make_polygon(profile_verts, close=True)
-        if hole_wires:
-            face = Face(wire, hole_wires)
-        else:
-            face = Face(wire)
-
-        # Extrude symmetric around Z=0
-        half_l = length_mm / 2.0
-        solid = Solid.extrude(face, Vector(0, 0, length_mm))
-        solid = solid.translate(Vector(0, 0, -half_l))
-
-        # Center XY at origin
-        bb = solid.bounding_box()
-        scx = (bb.min.X + bb.max.X) / 2.0
-        scy = (bb.min.Y + bb.max.Y) / 2.0
-        solid = solid.translate(Vector(-scx, -scy, 0))
-
-    except Exception as e:
-        logger.warning(f"build123d error: {e}")
-        return False
-
-    # Export STEP
-    if filepath_step:
-        filepath_step.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            export_step(solid, str(filepath_step))
-        except Exception as e:
-            logger.warning(f"STEP export error: {e}")
-
-    # Export STL (tessellate B-Rep solid via Mesher)
-    filepath_stl.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        m = Mesher()
-        m.add_shape(solid)
-        m.write(str(filepath_stl))
-    except Exception as e:
-        logger.warning(f"STL export error: {e}")
-        return False
-
-    return True
-
-
-def _trace_dxf_contour(profile: str) -> list[list[tuple[float, float]]] | None:
-    """Trace connected entities in the DXF to form closed contour loops.
-
-    Returns a list of contours, each a list of (x, y) tuples.
-    The first contour (largest area) is the outer boundary.
-    Subsequent contours are holes.
-    Returns None on failure.
-    """
-    import ezdxf
-    from ezdxf.math import Vec2
-
-    profile_dir = BASE_DIR / "library" / "profiles"
-    dxf_path = profile_dir / f"{profile}.dxf"
-    if not dxf_path.exists():
-        return None
-
-    try:
-        doc = ezdxf.readfile(str(dxf_path))
-    except Exception:
-        return None
-
-    # Find the main INSERT block
-    best_ents = []
-    best_area = 0.0
-    for e in doc.modelspace():
-        if e.dxftype() != 'INSERT':
-            continue
-        block = doc.blocks.get(e.dxf.name)
-        if not block:
-            continue
-        ents = [be for be in block if be.dxftype() in ('LINE','ARC','CIRCLE','LWPOLYLINE')]
-        if not ents:
-            continue
-        xs, ys = [], []
-        for ent in ents:
-            if ent.dxftype() == 'LINE':
-                xs.extend([ent.dxf.start.x, ent.dxf.end.x])
-                ys.extend([ent.dxf.start.y, ent.dxf.end.y])
-        if not xs:
-            continue
-        area = (max(xs) - min(xs)) * (max(ys) - min(ys))
-        if area > best_area:
-            best_area = area
-            best_ents = ents
-
-    if not best_ents:
-        return None
-
-    # Build adjacency graph: for each entity, store its endpoints
-    # LINE: (start, end), ARC: sample into segments, CIRCLE: sample into segments
-    segments: list[tuple[Vec2, Vec2]] = []
-    for ent in best_ents:
-        if ent.dxftype() == 'LINE':
-            segments.append((
-                Vec2(ent.dxf.start.x, ent.dxf.start.y),
-                Vec2(ent.dxf.end.x, ent.dxf.end.y),
-            ))
-        elif ent.dxftype() in ('ARC', 'CIRCLE'):
-            from ezdxf.path import make_path
-            path = make_path(ent)
-            verts = list(path.flattening(0.3))
-            for i in range(len(verts) - 1):
-                segments.append((
-                    Vec2(verts[i].x, verts[i].y),
-                    Vec2(verts[i + 1].x, verts[i + 1].y),
-                ))
-        elif ent.dxftype() == 'LWPOLYLINE':
-            pts = list(ent.vertices())
-            for i in range(len(pts) - 1):
-                segments.append((
-                    Vec2(pts[i][0], pts[i][1]),
-                    Vec2(pts[i + 1][0], pts[i + 1][1]),
-                ))
-
-    if len(segments) < 3:
-        return None
-
-    # Trace closed contours from segments
-    TOL = 1.0  # connection tolerance (mm) — DXF entities may have small gaps
-    used = [False] * len(segments)
-    contours: list[list[Vec2]] = []
-
-    while True:
-        # Find an unused segment to start tracing
-        start_idx = next((i for i, u in enumerate(used) if not u), None)
-        if start_idx is None:
-            break
-
-        contour: list[Vec2] = []
-        current = segments[start_idx][0]
-        contour.append(current)
-        used[start_idx] = True
-
-        # Follow the chain
-        target = segments[start_idx][1]
-        progress = True
-        while progress:
-            progress = False
-            best_dist = TOL
-            best_idx = -1
-            best_flip = False
-
-            for i, (a, b) in enumerate(segments):
-                if used[i]:
-                    continue
-                # Check both directions
-                da = (a - target).magnitude
-                db = (b - target).magnitude
-                if da < best_dist:
-                    best_dist = da
-                    best_idx = i
-                    best_flip = False
-                if db < best_dist:
-                    best_dist = db
-                    best_idx = i
-                    best_flip = True
-
-            if best_idx >= 0:
-                used[best_idx] = True
-                seg = segments[best_idx]
-                if best_flip:
-                    contour.append(seg[1])
-                    target = seg[1]
-                else:
-                    contour.append(seg[0])
-                    target = seg[0]
-                progress = True
-
-        # Check if the contour closes
-        if (contour[-1] - contour[0]).magnitude < TOL and len(contour) >= 3:
-            contours.append([(float(p.x), float(p.y)) for p in contour])
-
-    if not contours:
-        return None
-
-    # Sort by area (largest = outer boundary)
-    def polygon_area(verts):
-        area = 0.0
-        n = len(verts)
-        for i in range(n):
-            j = (i + 1) % n
-            area += verts[i][0] * verts[j][1] - verts[j][0] * verts[i][1]
-        return abs(area) / 2.0
-
-    contours.sort(key=polygon_area, reverse=True)
-    logger.info(f"DXF contours: {len(contours)} loops, outer={len(contours[0])} verts")
-    return contours
-
-
-def _read_dxf_profile(profile: str, expected_size_mm: float) -> np.ndarray | None:
-    """Read a DXF profile and return the outer contour polygon as a 2D numpy array (N,2).
-
-    Extracts ALL contour vertices (not just convex hull) to preserve
-    T-slots, channels, and other concave features of the profile.
-    Returns None if the DXF cannot be read.
-    """
-    import ezdxf
-    from ezdxf.path import make_path
-
-    profile_dir = BASE_DIR / "library" / "profiles"
-    dxf_path = profile_dir / f"{profile}.dxf"
-    if not dxf_path.exists():
-        logger.warning(f"DXF not found: {dxf_path}")
-        return None
-
-    try:
-        doc = ezdxf.readfile(str(dxf_path))
-    except Exception as e:
-        logger.warning(f"DXF read error: {e}")
-        return None
-
-    # Find the INSERT block with the largest bbox — this is the main profile
-    best_ents = []
-    best_area = 0.0
-    for e in doc.modelspace():
-        if e.dxftype() != 'INSERT':
-            continue
-        block = doc.blocks.get(e.dxf.name)
-        if not block:
-            continue
-        ents = [be for be in block if be.dxftype() in ('LINE','ARC','CIRCLE','LWPOLYLINE')]
-        if not ents:
-            continue
-        xs, ys = [], []
-        for ent in ents:
-            if ent.dxftype() == 'LINE':
-                xs.extend([ent.dxf.start.x, ent.dxf.end.x])
-                ys.extend([ent.dxf.start.y, ent.dxf.end.y])
-        if not xs:
-            continue
-        area = (max(xs) - min(xs)) * (max(ys) - min(ys))
-        if area > best_area:
-            best_area = area
-            best_ents = ents
-
-    if not best_ents:
-        # Fallback: use modelspace entities directly
-        best_ents = [e for e in doc.modelspace() if e.dxftype() in ('LINE','ARC','CIRCLE','LWPOLYLINE')]
-
-    if not best_ents:
-        return None
-
-    # Convert to paths (preserving entity connection order, not radial sort)
-    try:
-        all_verts: list[list[float]] = []
-        for ent in best_ents:
-            path = make_path(ent)
-            for v in path.flattening(0.3):
-                all_verts.append([v.x, v.y])
-
-        if len(all_verts) < 3:
-            return None
-
-        outline = np.array(all_verts, dtype=np.float64)
-
-        # Deduplicate consecutive points that are very close
-        keep = [True] * len(outline)
-        for i in range(len(outline)):
-            j = (i + 1) % len(outline)
-            if np.sqrt((outline[i,0]-outline[j,0])**2 + (outline[i,1]-outline[j,1])**2) < 0.05:
-                keep[i] = False
-        outline = outline[keep]
-
-    except Exception as e:
-        logger.warning(f"Path error: {e}")
-        return None
-
-    bbox_w = outline[:, 0].max() - outline[:, 0].min()
-    bbox_h = outline[:, 1].max() - outline[:, 1].min()
-    logger.info(f"DXF profile: {len(outline)} verts, {bbox_w:.0f}x{bbox_h:.0f}mm")
-    return outline
-
-
-def _extrude_dxf_to_stl_pure(
-    outline_2d: np.ndarray, length_mm: float, filepath: Path,
-) -> None:
-    """Extrude a 2D polygon (N,2) by length_mm along Z, write binary STL.
-
-    Uses fan triangulation. Profile is auto-centered at XY origin.
-    Z is symmetric around 0 (extrusion along Z in solver coords).
-    """
-    import struct
-
-    # Center the profile in XY using bounding box center
-    cx = float((outline_2d[:, 0].max() + outline_2d[:, 0].min()) / 2.0)
-    cy = float((outline_2d[:, 1].max() + outline_2d[:, 1].min()) / 2.0)
-    centered = outline_2d - np.array([cx, cy], dtype=np.float64)
-
-    n = len(outline_2d)
-    half_l = float(length_mm) / 2.0
-
-    bottom = np.column_stack([centered, np.full(n, -half_l, dtype=np.float64)])
-    top = np.column_stack([centered, np.full(n, half_l, dtype=np.float64)])
-    center_b = np.array([0.0, 0.0, -half_l], dtype=np.float64)
-    center_t = np.array([0.0, 0.0, half_l], dtype=np.float64)
-
-    triangles: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-
-    for i in range(n):
-        j = (i + 1) % n
-        triangles.append((bottom[j], bottom[i], center_b))
-    for i in range(n):
-        j = (i + 1) % n
-        triangles.append((top[i], top[j], center_t))
-    for i in range(n):
-        j = (i + 1) % n
-        triangles.append((bottom[i], bottom[j], top[j]))
-        triangles.append((bottom[i], top[j], top[i]))
-
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    with open(filepath, 'wb') as f:
-        f.write(b'\x00' * 80)
-        f.write(struct.pack('<I', len(triangles)))
-        for a, b_val, c_val in triangles:
-            n_vec = np.cross(b_val - a, c_val - a)
-            norm = float(np.linalg.norm(n_vec))
-            if norm < 1e-10:
-                n_vec = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-            else:
-                n_vec = n_vec / norm
-            nx, ny, nz = float(n_vec[0]), float(n_vec[1]), float(n_vec[2])
-            f.write(struct.pack('<3f', nx, ny, nz))
-            for arr in (a, b_val, c_val):
-                vx, vy, vz = float(arr[0]), float(arr[1]), float(arr[2])
-                f.write(struct.pack('<3f', vx, vy, vz))
-            f.write(struct.pack('<H', 0))
-
-
-def _extrude_profile_to_stl(
-    part_type: str, profile_size_mm: float, length_mm: float, filepath: Path,
-    tabletop_w: float = 0, tabletop_d: float = 0,
-) -> None:
-    """Generate an STL by extruding a rectangular profile (pure Python, no CAD deps).
-
-    Uses profile_size_mm (e.g. 30mm for 3030) for legs/beams or
-    tabletop_w×tabletop_d for the tabletop. Writes binary STL centered at origin.
-    """
-    import struct, numpy as np
-
-    if part_type == "tabletop":
-        hw, hd, ht = tabletop_w / 2, tabletop_d / 2, length_mm / 2
-        # 8 corners of the box
-        corners = np.array([
-            [-hw, -hd, -ht], [hw, -hd, -ht], [hw, hd, -ht], [-hw, hd, -ht],  # bottom
-            [-hw, -hd, ht],  [hw, -hd, ht],  [hw, hd, ht],  [-hw, hd, ht],   # top
-        ], dtype=np.float64)
-        faces = [
-            (0,1,2), (0,2,3),  # -Z
-            (4,7,6), (4,6,5),  # +Z
-            (0,4,5), (0,5,1),  # -Y
-            (2,6,7), (2,7,3),  # +Y
-            (1,5,6), (1,6,2),  # +X
-            (0,3,7), (0,7,4),  # -X
-        ]
-    else:
-        hs = profile_size_mm / 2
-        hl = length_mm / 2
-        corners = np.array([
-            [-hs, -hs, -hl], [hs, -hs, -hl], [hs, hs, -hl], [-hs, hs, -hl],
-            [-hs, -hs, hl],  [hs, -hs, hl],  [hs, hs, hl],  [-hs, hs, hl],
-        ], dtype=np.float64)
-        faces = [
-            (0,1,2), (0,2,3), (4,7,6), (4,6,5),
-            (0,4,5), (0,5,1), (2,6,7), (2,7,3),
-            (1,5,6), (1,6,2), (0,3,7), (0,7,4),
-        ]
-
-    triangles = [(corners[a], corners[b], corners[c]) for a, b, c in faces]
-
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    with open(filepath, 'wb') as f:
-        f.write(b'\x00' * 80)
-        f.write(struct.pack('<I', len(triangles)))
-        for a, b_val, c_val in triangles:
-            n = np.cross(b_val - a, c_val - a)
-            n = n / (np.linalg.norm(n) + 1e-10)
-            nx, ny, nz = float(n[0]), float(n[1]), float(n[2])
-            f.write(struct.pack('<3f', nx, ny, nz))
-            for v in (a, b_val, c_val):
-                vx, vy, vz = float(v[0]), float(v[1]), float(v[2])
-                f.write(struct.pack('<3f', vx, vy, vz))
-            f.write(struct.pack('<H', 0))
-
-
-def _write_fast_stl_box(
-    sx: float, sy: float, sz: float, filepath: Path,
-) -> None:
-    """Write a binary STL of a box centered at origin, dimensions sx×sy×sz (mm).
-
-    Solver coords: X=right, Y=forward, Z=up.
-    The box is an axis-aligned extrusion: sx along X, sy along Y, sz along Z.
-    """
-    import struct
-
-    hx, hy, hz = sx / 2, sy / 2, sz / 2
-    # 6 faces, 2 triangles each = 12 triangles
-    # Each face: 4 corners → 2 triangles
-    faces = [
-        # +X face (right): normal (+1,0,0)
-        [ (+hx, -hy, -hz), (+hx, +hy, -hz), (+hx, +hy, +hz), (+hx, -hy, +hz) ],
-        # -X face (left): normal (-1,0,0)
-        [ (-hx, -hy, +hz), (-hx, +hy, +hz), (-hx, +hy, -hz), (-hx, -hy, -hz) ],
-        # +Y face (forward): normal (0,+1,0)
-        [ (-hx, +hy, -hz), (-hx, +hy, +hz), (+hx, +hy, +hz), (+hx, +hy, -hz) ],
-        # -Y face (backward): normal (0,-1,0)
-        [ (-hx, -hy, +hz), (-hx, -hy, -hz), (+hx, -hy, -hz), (+hx, -hy, +hz) ],
-        # +Z face (top): normal (0,0,+1)
-        [ (-hx, -hy, +hz), (+hx, -hy, +hz), (+hx, +hy, +hz), (-hx, +hy, +hz) ],
-        # -Z face (bottom): normal (0,0,-1)
-        [ (-hx, -hy, -hz), (-hx, +hy, -hz), (+hx, +hy, -hz), (+hx, -hy, -hz) ],
-    ]
-    normals = [
-        (1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1),
-    ]
-
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    with open(filepath, 'wb') as f:
-        f.write(b'\x00' * 80)  # header
-        f.write(struct.pack('<I', 12))  # triangle count
-        for face_idx, corners in enumerate(faces):
-            nx, ny, nz = normals[face_idx]
-            # Triangle 1: corners 0-1-2
-            f.write(struct.pack('<3f', nx, ny, nz))
-            for ci in (0, 1, 2):
-                f.write(struct.pack('<3f', *corners[ci]))
-            f.write(struct.pack('<H', 0))
-            # Triangle 2: corners 0-2-3
-            f.write(struct.pack('<3f', nx, ny, nz))
-            for ci in (0, 2, 3):
-                f.write(struct.pack('<3f', *corners[ci]))
-            f.write(struct.pack('<H', 0))
-
-
-def _build_joints_and_poses(solved, meta, profile_size, extrude_fn, model_id, req):
-    """Shared helper: generate STL per part, build joints/world_poses, return cache entry."""
-    output_root = OUTPUT_DIR / model_id / "basic_desk"
-    visual_dir = output_root / "meshes" / "visual"
-
-    parts = []
-    for sp in solved.parts:
-        stl_filename = f"{sp.name}.stl"
-        stl_filepath = visual_dir / stl_filename
-        extrude_fn(sp, stl_filepath)
-        stl_rel = stl_filepath.relative_to(OUTPUT_DIR)
-        parts.append({
-            "name": sp.name, "part_type": sp.part_type,
-            "profile": sp.profile, "board": sp.board, "material": sp.material,
-            "dimensions": {
-                "extrusion_length": sp.extrusion_length,
-                "tabletop_width": sp.tabletop_width,
-                "tabletop_depth": sp.tabletop_depth,
-                "tabletop_thickness": sp.tabletop_thickness,
-            },
-            "mass_kg": None, "stl_url": f"/static/models/{stl_rel.as_posix()}",
-        })
-
-    # Build joints
-    joints = []
-    tabletop = next((sp for sp in solved.parts if sp.part_type == "tabletop"), None)
-    if tabletop and tabletop.pose:
-        joints.append({
-            "name": "base_link_to_tabletop", "parent": "base_link", "child": "tabletop",
-            "origin": {"x": tabletop.pose.x, "y": tabletop.pose.y, "z": tabletop.pose.z,
-                       "roll": tabletop.pose.roll, "pitch": tabletop.pose.pitch, "yaw": tabletop.pose.yaw},
-        })
-    for sp in solved.parts:
-        if sp.part_type in ("leg", "beam") and sp.pose:
-            joints.append({
-                "name": f"tabletop_to_{sp.name}", "parent": "tabletop", "child": sp.name,
-                "origin": {"x": sp.pose.x, "y": sp.pose.y, "z": sp.pose.z,
-                           "roll": sp.pose.roll, "pitch": sp.pose.pitch, "yaw": sp.pose.yaw},
-            })
-
-    # World poses via tree walk
-    children_map: dict[str, list[dict]] = {}
-    for j in joints:
-        children_map.setdefault(j["parent"], []).append(j)
-
-    def walk(link_name, pp, _):
-        r = {}
-        for jt in children_map.get(link_name, []):
-            o = jt["origin"]
-            ca = {"x": pp[0] + o["x"], "y": pp[1] + o["y"], "z": pp[2] + o["z"],
-                  "roll": o["roll"], "pitch": o["pitch"], "yaw": o["yaw"]}
-            r[jt["child"]] = ca
-            r.update(walk(jt["child"], (ca["x"], ca["y"], ca["z"]), (ca["roll"], ca["pitch"], ca["yaw"])))
-        return r
-
-    world_poses = walk("base_link", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
-    for p in parts:
-        wp = world_poses.get(p["name"])
-        if wp:
-            p["pose"] = wp
-        p["joint_parent"] = next((j["parent"] for j in joints if j["child"] == p["name"]), None)
-
-    return {
-        "model_id": model_id, "name": meta["name"], "status": "full", "parts": parts,
-        "stl_url": parts[0]["stl_url"] if parts else None,
-        "urdf_url": None, "joints": joints,
-        "dimensions": {"width": req.width, "depth": req.depth,
-                       "height": req.height, "tabletop_thickness": req.tabletop_thickness},
-    }
-
-
-def _generate_trimesh(meta: dict, req: GenerateRequest, solved, model_id: str) -> dict:
-    """build123d mode: ezdxf reads DXF → build123d Wire→Face→Solid→STEP+STL.
-
-    Generates proper B-Rep solids with STEP export, then tessellates to STL.
-    Handles concave profiles (T-slots) correctly.
-    Falls back to pure Python extrusion if build123d fails.
-    """
-    profile_map = {"2020": 20.0, "3030": 30.0, "4040": 40.0}
-    profile_size = profile_map.get(req.profile, 30.0)
-    output_root = OUTPUT_DIR / model_id / "basic_desk"
-    visual_dir = output_root / "meshes" / "visual"
-    cad_dir = output_root / "cad"
-
-    def extrude_part(sp, filepath):
-        step_path = Path(str(filepath).replace("/meshes/visual/", "/cad/").replace(".stl", ".step"))
-
-        if sp.part_type == "tabletop":
-            ok = _build123d_extrude(
-                req.profile, sp.tabletop_thickness, filepath, step_path,
-                tabletop_w=sp.tabletop_width, tabletop_d=sp.tabletop_depth,
-            )
-        else:
-            ok = _build123d_extrude(req.profile, sp.extrusion_length, filepath, step_path)
-
-        if not ok:
-            # Fallback: pure Python extrusion
-            logger.warning(f"build123d failed for {sp.name}, using pure Python fallback")
-            if sp.part_type == "tabletop":
-                hw, hd = sp.tabletop_width / 2.0, sp.tabletop_depth / 2.0
-                rect = np.array([[-hw,-hd],[hw,-hd],[hw,hd],[-hw,hd]], dtype=np.float64)
-                _extrude_dxf_to_stl_pure(rect, sp.tabletop_thickness, filepath)
-            else:
-                _extrude_profile_to_stl(
-                    sp.part_type, profile_size, sp.extrusion_length, filepath,
-                )
-            # Fallback to rectangular
-            _extrude_profile_to_stl(
-                sp.part_type, profile_size, sp.extrusion_length, filepath,
-            )
-
-    return _build_joints_and_poses(solved, meta, profile_size, extrude_part, model_id, req)
-
-
-def _generate_fast(meta: dict, req: GenerateRequest, solved, model_id: str) -> dict:
-    """Fast mode: skip CAD pipeline, generate simple box STLs directly.
-
-    Uses only extrusion (no DXF import, no hole cutting, no STEP export).
-    """
-    profile_map = {"2020": 20.0, "3030": 30.0, "4040": 40.0}
-    profile_size = profile_map.get(req.profile, 30.0)
-    output_root = OUTPUT_DIR / model_id / "basic_desk"
-    visual_dir = output_root / "meshes" / "visual"
-
-    parts = []
-    for sp in solved.parts:
-        stl_path = None
-        stl_filename = f"{sp.name}.stl"
-        stl_filepath = visual_dir / stl_filename
-
-        if sp.part_type == "tabletop":
-            # Large flat box: width × depth × thickness
-            _write_fast_stl_box(
-                sp.tabletop_width, sp.tabletop_depth, sp.tabletop_thickness,
-                stl_filepath,
-            )
-        elif sp.part_type in ("leg", "beam"):
-            # Square extrusion: profile × profile × length
-            _write_fast_stl_box(
-                profile_size, profile_size, sp.extrusion_length,
-                stl_filepath,
-            )
-        else:
-            _write_fast_stl_box(profile_size, profile_size, sp.extrusion_length, stl_filepath)
-
-        stl_rel = stl_filepath.relative_to(OUTPUT_DIR)
-        stl_path = f"/static/models/{stl_rel.as_posix()}"
-
-        parts.append({
-            "name": sp.name, "part_type": sp.part_type,
-            "profile": sp.profile, "board": sp.board, "material": sp.material,
-            "dimensions": {
-                "extrusion_length": sp.extrusion_length,
-                "tabletop_width": sp.tabletop_width,
-                "tabletop_depth": sp.tabletop_depth,
-                "tabletop_thickness": sp.tabletop_thickness,
-            },
-            "mass_kg": None, "stl_url": stl_path,
-        })
-
-    # Build URDF joints and world poses (same as full pipeline)
-    from parametric_furniture.models.pose import Pose
-
-    # Copy joint structure from the solved assembly
-    # For fast mode, we reconstruct joints from solver data
-    joints = []
-    # base_link → tabletop
-    tabletop = next((sp for sp in solved.parts if sp.part_type == "tabletop"), None)
-    if tabletop and tabletop.pose:
-        joints.append({
-            "name": "base_link_to_tabletop",
-            "parent": "base_link",
-            "child": "tabletop",
-            "origin": {"x": tabletop.pose.x, "y": tabletop.pose.y, "z": tabletop.pose.z,
-                       "roll": tabletop.pose.roll, "pitch": tabletop.pose.pitch, "yaw": tabletop.pose.yaw},
-        })
-
-    # tabletop → each leg/beam
-    for sp in solved.parts:
-        if sp.part_type in ("leg", "beam") and sp.pose:
-            joint_name = f"tabletop_to_{sp.name}"
-            joints.append({
-                "name": joint_name, "parent": "tabletop", "child": sp.name,
-                "origin": {"x": sp.pose.x, "y": sp.pose.y, "z": sp.pose.z,
-                           "roll": sp.pose.roll, "pitch": sp.pose.pitch, "yaw": sp.pose.yaw},
-            })
-
-    # Compute world poses via tree walk
-    children_map: dict[str, list[dict]] = {}
-    for j in joints:
-        children_map.setdefault(j["parent"], []).append(j)
-
-    def walk_tree(link_name: str, parent_pos: tuple, _parent_rot: tuple):
-        results = {}
-        for joint in children_map.get(link_name, []):
-            child_name = joint["child"]
-            origin = joint["origin"]
-            child_abs = {
-                "x": parent_pos[0] + origin["x"], "y": parent_pos[1] + origin["y"],
-                "z": parent_pos[2] + origin["z"],
-                "roll": origin["roll"], "pitch": origin["pitch"], "yaw": origin["yaw"],
-            }
-            results[child_name] = child_abs
-            results.update(walk_tree(child_name,
-                (child_abs["x"], child_abs["y"], child_abs["z"]),
-                (child_abs["roll"], child_abs["pitch"], child_abs["yaw"])))
-        return results
-
-    world_poses = walk_tree("base_link", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
-
-    # Add pose + joint_parent to parts
-    for p in parts:
-        wp = world_poses.get(p["name"])
-        if wp:
-            p["pose"] = wp
-        p["joint_parent"] = next((j["parent"] for j in joints if j["child"] == p["name"]), None)
-
-    return {
-        "model_id": model_id,
-        "name": meta["name"],
-        "status": "full",
-        "parts": parts,
-        "stl_url": parts[0]["stl_url"] if parts else None,
-        "urdf_url": None,
-        "joints": joints,
-        "dimensions": {"width": req.width, "depth": req.depth,
-                       "height": req.height, "tabletop_thickness": req.tabletop_thickness},
-    }
-
-
 def _solver_only_generate(req: GenerateRequest) -> dict:
     """Fast solver-only generation — no CAD build. Returns dimensions + poses."""
     template = _load_template(req.template_id)
@@ -1554,75 +866,49 @@ def compute_bracket_rotation(req: BracketRotationRequest) -> BracketRotationResp
         raise HTTPException(500, str(e))
 
 def _compute(req: BracketRotationRequest) -> BracketRotationResponse:
+    """Compute the rotation that orients a corner bracket onto two faces.
+
+    The bracket STL is an L-plate in the XY plane whose two mounting faces
+    (the inner faces of the two plates) have model-space normals -X and -Y.
+    To make those plates press against two target extrusion faces with
+    outward normals f1, f2, the rotation must satisfy::
+
+        R . (1,0,0) = f1      R . (0,1,0) = f2
+
+    so R is simply the matrix with columns f1, f2, f1 x f2. The Euler angles
+    are extracted in XYZ order (R = Rx*Ry*Rz) to match how the Web viewer
+    applies rotations; the client prefers the returned rotation_matrix.
+    """
     logger.info(f"Bracket rotation: face1={req.face1}, face2={req.face2}")
-    import sys
+    import math
+
     try:
         f1 = np.array(req.face1, dtype=float)
         f2 = np.array(req.face2, dtype=float)
         f1 /= np.linalg.norm(f1)
         f2 /= np.linalg.norm(f2)
-        # Sort by axis index so click order doesn't affect rotation
-        def _axis_idx(v): return int(np.argmax(np.abs(v)))
-        if _axis_idx(f1) > _axis_idx(f2):
-            f1, f2 = f2, f1
-        print(f"  step1: f1={f1}, f2={f2} (sorted)", flush=True)
 
-        # Bracket default flat faces (from STL analysis): choose per axis
-        BRACKET_FACE = {0: np.array([-1.0, 0.0, 0.0]),  # X axis
-                        1: np.array([0.0, -1.0, 0.0]),  # Y axis
-                        2: np.array([0.0, 0.0, 1.0])}   # Z axis
-        a1 = int(np.argmax(np.abs(f1)))
-        a2 = int(np.argmax(np.abs(f2)))
-        d1 = BRACKET_FACE[a1]
-        d2 = BRACKET_FACE[a2]
-        d3 = np.cross(d1, d2)
-        d3 /= np.linalg.norm(d3)
-        print(f"  step2: d1={d1}, d2={d2}, axes={a1},{a2}", flush=True)
-
-        t1 = -f1; t2 = -f2
-        t3 = np.cross(t1, t2)
-        n3 = np.linalg.norm(t3)
-        if n3 < 1e-10:
+        # A corner bracket joins two *perpendicular* extrusion faces.
+        cos_ang = float(np.dot(f1, f2))
+        if abs(cos_ang) > 0.05:
+            raise HTTPException(
+                400,
+                f"Faces are not perpendicular (dot={cos_ang:.3f}); "
+                "a corner bracket joins two perpendicular faces",
+            )
+        if np.linalg.norm(np.cross(f1, f2)) < 1e-10:
             raise HTTPException(400, "Face normals are parallel")
-        t3 /= n3
-        print(f"  step3: t1={t1}, t2={t2}, t3={t3}", flush=True)
 
-        # Manual 3x3 matrix multiply to avoid numpy threading issues
-        def mat_mul(A, B):
-            return [[sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+        # Make the pair an exact orthonormal basis (Gram-Schmidt).
+        f2 = f2 - cos_ang * f1
+        f2 /= np.linalg.norm(f2)
+        f3 = np.cross(f1, f2)  # unit, since f1 _|_ f2 and both are unit
 
-        def transpose(M):
-            return [[M[j][i] for j in range(3)] for i in range(3)]
+        # R = [f1 f2 f3]  ->  R.(1,0,0)=f1, R.(0,1,0)=f2.
+        R = np.column_stack([f1, f2, f3])
+        R_mat = [[float(v) for v in row] for row in R]
 
-        S_mat = [[float(d1[i]), float(d2[i]), float(d3[i])] for i in range(3)]
-        T_mat = [[float(t1[i]), float(t2[i]), float(t3[i])] for i in range(3)]
-        R_mat = mat_mul(T_mat, transpose(S_mat))
-        print(f"  step4: R={R_mat}", flush=True)
-
-        R = np.array(R_mat)
-
-        r20 = R_mat[2][0]; r21 = R_mat[2][1]; r22 = R_mat[2][2]
-        r10 = R_mat[1][0]; r00 = R_mat[0][0]; r01 = R_mat[0][1]; r02 = R_mat[0][2]
-        import math
-        if abs(r20) < 0.99999:
-            pitch = -math.asin(r20)
-            roll = math.atan2(r21, r22)
-            yaw = math.atan2(r10, r00)
-        else:
-            yaw = 0.0
-            pitch = math.pi / 2 if r20 < -0.99999 else -math.pi / 2
-            roll = math.atan2(-r01, r02)
-        print(f"  step5: roll={roll}, pitch={pitch}, yaw={yaw}", flush=True)
-
-        # Z+face pairs: same sign → 270deg, opposite → 90deg
-        if 2 in (a1, a2):
-            z_face = f1 if a1 == 2 else f2
-            z_sign = 1 if z_face[2] > 0 else -1
-            other = f2 if a1 == 2 else f1
-            other_ax = a2 if a1 == 2 else a1
-            other_sign = 1 if other[other_ax] > 0 else -1
-            same_sign = (other_sign == z_sign)
-            pitch += 3 * math.pi / 2 if same_sign else math.pi / 2
+        roll, pitch, yaw = _euler_xyz(R)
 
         r = BracketRotationResponse(
             roll=round(float(math.degrees(roll)), 1),
@@ -1630,11 +916,53 @@ def _compute(req: BracketRotationRequest) -> BracketRotationResponse:
             yaw=round(float(math.degrees(yaw)), 1),
             rotation_matrix=R_mat,
         )
-        logger.info(f"  step6: response ready")
+        logger.info(f"Bracket rotation: roll={r.roll} pitch={r.pitch} yaw={r.yaw}")
         return r
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Bracket rotation crashed")
         raise
+
+
+def _euler_xyz(R):
+    """Extract XYZ-order Euler angles from R = Rx(roll)*Ry(pitch)*Rz(yaw)."""
+    import math
+
+    if abs(R[0, 2]) < 0.999999:
+        pitch = math.asin(R[0, 2])
+        yaw = math.atan2(-R[0, 1], R[0, 0])
+        roll = math.atan2(-R[1, 2], R[2, 2])
+    else:  # pitch = +-90 deg (gimbal lock)
+        pitch = math.asin(R[0, 2])
+        roll = 0.0
+        yaw = math.atan2(-R[1, 0], R[1, 1])
+    return roll, pitch, yaw
+
+
+class DiyBracketLogRequest(BaseModel):
+    """One DIY-builder bracket event, persisted as a JSONL line.
+
+    event: "corner_hints" (preview-mode hints) | "bracket_placed" (two-face
+    double-click placement). payload carries the browser-side details; the
+    server stamps a receive time so multi-browser sessions are comparable.
+    """
+    event: str
+    payload: dict
+
+
+@app.post("/api/log/bracket")
+def log_bracket(req: DiyBracketLogRequest):
+    """Append a bracket log entry to logs/diy_brackets.jsonl (one JSON per line)."""
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "event": req.event,
+        **req.payload,
+    }
+    with _log_lock:
+        with open(DIY_BRACKET_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1652,5 +980,23 @@ app.mount("/static/library", StaticFiles(directory=str(BASE_DIR / "library")), n
 
 if __name__ == "__main__":
     import uvicorn
+
+    # Force UTF-8 stdout so the Chinese guard message renders in Git Bash and
+    # other UTF-8 terminals (not just the Windows console API).
+    if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+
+    # Second-launch guard: if an instance is already running, print its PID and
+    # a copy-paste kill command, then exit WITHOUT starting a second server.
+    existing = running_server_pid()
+    if existing is not None:
+        print("=" * 60)
+        print("[server] 检测到后端已在运行,跳过二次启动。")
+        print(f"[server] 正在运行的进程 PID = {existing}")
+        print("[server] 可杀死该进程的命令:")
+        print(f"         {_kill_command(existing)}")
+        print("=" * 60)
+        sys.exit(0)
+
     logger.info("WoodCraft Backend v2 → http://0.0.0.0:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

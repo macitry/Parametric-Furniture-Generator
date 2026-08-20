@@ -130,7 +130,7 @@ C:/Users/mac/.conda/envs/webrtc_env/python.exe server.py
 ### 核心特性
 
 - **模型缓存**：启动时后台预热生成默认模型配置，缓存命中时响应 <100ms
-- **STL 质量分级**：`fast`（纯 Python box 挤出）、`trimesh`（build123d B-Rep + STEP）、`web` / `standard` / `fine`（VisualCAD 管线）
+- **STL 质量分级**：`web` / `standard` / `fine`（均走 VisualCAD 管线；旧的 `fast` / `trimesh` 档已移除）
 - **CORS 已开放**，前端可直接调用
 
 ### API 端点
@@ -151,8 +151,8 @@ C:/Users/mac/.conda/envs/webrtc_env/python.exe server.py
 
 | 序号 | 参数 | STL 模式 |
 |------|------|---------|
-| 1 | 1200×600×750mm，3030 型材 | trimesh |
-| 2 | 1500×700×750mm，3030 型材 | trimesh |
+| 1 | 1200×600×750mm，3030 型材 | web |
+| 2 | 1500×700×750mm，3030 型材 | web |
 
 ## 项目结构
 

@@ -12,3 +12,6 @@ output/*
 !output/pregen/
 output/pregen/*
 !output/pregen/.gitkeep
+
+# Runtime logs
+logs/
