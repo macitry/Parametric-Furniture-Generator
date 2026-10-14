@@ -203,6 +203,11 @@ class GenerateRequest(BaseModel):
     board_material: str = Field(default="plywood")
     color: str = Field(default="natural")
     stl_quality: str = Field(default="web")
+    # Ask for the solver's numbers only, and do NOT start a CAD build. The
+    # customer page sets this while a dimension is being dragged: a drag passes
+    # through dozens of size combinations, and every cache miss on the normal
+    # path spawns a real build123d run in its own thread. See `generate_model`.
+    solve_only: bool = False
 
 
 class GenerateResponse(BaseModel):
@@ -736,6 +741,23 @@ def generate_model(req: GenerateRequest) -> GenerateResponse:
             stl_url=cached.get("stl_url"),
             urdf_url=cached.get("urdf_url"),
             joints=cached.get("joints", []),
+        )
+
+    # Solver-only ask: the caller wants the numbers to draw with, not a model.
+    # Deliberately NOT written to `model_cache` and no thread started. A
+    # placeholder per intermediate value would grow the cache with entries
+    # nobody will finish, and — because a cache miss is what spawns the build —
+    # it would start a real CAD run per intermediate value too: one drag of a
+    # slider is dozens of build123d runs, each with its own `_cleanup_old_models`
+    # pass over the output directory.
+    if req.solve_only:
+        logger.info(f"Generate: solve-only {key} — no CAD, no cache entry")
+        entry = _solver_only_generate(req)
+        return GenerateResponse(
+            model_id=entry["model_id"], name=meta["name"], status="warming",
+            parts=[PartInfo(**p) for p in entry["parts"]],
+            dimensions=entry["dimensions"],
+            message="Solver-only preview; no CAD build started.",
         )
 
     # Cache miss — solver data immediately, then background generation
