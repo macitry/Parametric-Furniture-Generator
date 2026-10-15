@@ -208,6 +208,13 @@ class GenerateRequest(BaseModel):
     # through dozens of size combinations, and every cache miss on the normal
     # path spawns a real build123d run in its own thread. See `generate_model`.
     solve_only: bool = False
+    # Re-attempt a build that previously FAILED. A failed build is cached as
+    # `status: "solver_only"` (see `_do_generate_with_progress`), and the
+    # cache-hit path returns it for ever — so without this a transient failure
+    # marks those dimensions permanently broken, and no amount of retrying on
+    # the client can do anything about it. Only meaningful against a cached
+    # failure: a good cached entry is still returned as-is.
+    retry_failed: bool = False
 
 
 class GenerateResponse(BaseModel):
@@ -732,7 +739,14 @@ def generate_model(req: GenerateRequest) -> GenerateResponse:
     with _cache_lock:
         cached = model_cache.get(key)
 
-    if cached:
+    # A cached FAILURE is not a hit worth having. `status: "solver_only"` is what
+    # `_do_generate_with_progress` stamps on an entry whose CAD build threw, and
+    # this branch would hand that same failure back for ever — a transient
+    # failure marking those dimensions permanently broken. `retry_failed` is the
+    # caller saying it wants the build tried again, so the entry is treated as
+    # absent and the rest of this function re-runs and replaces it.
+    cached_failed = cached is not None and cached.get("status") == "solver_only"
+    if cached and not (req.retry_failed and cached_failed):
         logger.info(f"Generate: cache HIT {key}")
         return GenerateResponse(
             model_id=cached["model_id"], name=cached["name"], status=cached["status"],
